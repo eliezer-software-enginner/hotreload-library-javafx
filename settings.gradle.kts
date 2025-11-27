@@ -1,0 +1,1 @@
+rootProject.name = "hot-reloading-javafx-lib"
