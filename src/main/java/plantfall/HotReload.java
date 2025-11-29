@@ -44,6 +44,10 @@ public class HotReload {
         //this.classesToExclude.add("my_app.CoesionApp");
         //this.classesToExclude.add("my_app.ReloadableWindow");
         //this.classesToExclude.add("my_app.Reloader");
+
+        this.classesToExclude.add(CoesionApp.class.getName());
+        this.classesToExclude.add(ReloadableWindow.class.getName());
+        this.classesToExclude.add(Reloader.class.getName());
     }
 
     public void start() {
