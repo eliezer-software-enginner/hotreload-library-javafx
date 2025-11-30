@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
 
 public class HotReload {
@@ -19,6 +20,9 @@ public class HotReload {
     private volatile boolean running = true;
 
     private final Path resourcesPath;
+
+    // Timeout de 500ms para estabilidade.
+    private static final long WATCHER_TIMEOUT_MS = 500;
 
     /**
      * @param src O caminho para os arquivos .java (ex: "src/main/java").
@@ -39,12 +43,6 @@ public class HotReload {
         // Adiciona a interface de biblioteca para evitar ClassCastException (regra 1)
         this.classesToExclude.add(Reloader.class.getName());
 
-        // 💥 NOVO: Excluir a Annotation para garantir que o System Class Loader a veja
-        // (Ainda precisa usar o FQCN, pois ela está no mesmo pacote da aplicação por enquanto)
-        //this.classesToExclude.add("my_app.CoesionApp");
-        //this.classesToExclude.add("my_app.ReloadableWindow");
-        //this.classesToExclude.add("my_app.Reloader");
-
         this.classesToExclude.add(CoesionApp.class.getName());
         this.classesToExclude.add(ReloadableWindow.class.getName());
         this.classesToExclude.add(Reloader.class.getName());
@@ -55,9 +53,7 @@ public class HotReload {
         t.setDaemon(true);
         t.start();
 
-        // 🛑 Lógica de Inicialização Automática (Bootstrapping da ID)
-        // Chamamos callReloadEntry() imediatamente para forçar a primeira injeção
-        // de dependência (Stage window) e a execução do initView().
+        // Lógica de Inicialização Automática (Bootstrapping da ID)
         try {
             System.out.println("[HotReload] Performing initial UI setup and Dependency Injection...");
             callReloadEntry();
@@ -70,8 +66,8 @@ public class HotReload {
     private void watchLoop() {
         try (WatchService ws = FileSystems.getDefault().newWatchService()) {
 
-            // 1. Registra o Source Path (código Java)
-            sourcePath.register(ws, StandardWatchEventKinds.ENTRY_MODIFY, StandardWatchEventKinds.ENTRY_CREATE);
+            // 1. Registra o Source Path (código Java) RECURSIVAMENTE
+            this.registerAll(ws, this.sourcePath);
 
             // 2. Registra o Resources Path (recursos)
             resourcesPath.register(ws, StandardWatchEventKinds.ENTRY_MODIFY, StandardWatchEventKinds.ENTRY_CREATE);
@@ -85,12 +81,27 @@ public class HotReload {
                             !event.kind().equals(StandardWatchEventKinds.ENTRY_CREATE))
                         continue;
 
-                    Path changedFolder = (Path) key.watchable(); // Pasta que sofreu a mudança (sourcePath ou resourcesPath)
+                    Path changedFolder = (Path) key.watchable(); // Pasta que sofreu a mudança (pode ser subdiretório)
                     Path changedFile = changedFolder.resolve((Path) event.context());
 
-                    if (changedFolder.equals(sourcePath) && changedFile.toString().endsWith(".java")) {
-                        // Mudança em arquivo .java: COMPILA + RECARREGA
+                    // A verificação "startsWith" garante que subdiretórios funcionem.
+                    if (changedFolder.startsWith(sourcePath) && changedFile.toString().endsWith(".java")) {
+
+                        String className = this.getFullyQualifiedClassName(changedFile);
+
+                        // Pausa para estabilidade após o movimento/salvamento
+                        Thread.sleep(WATCHER_TIMEOUT_MS);
+
+                        // Caso especial: App alterada (apenas compila para atualizar anotação)
+                        if (this.classesToExclude.contains(className)) {
+                            System.out.println("[HotReload] App Change detected, compiling but skipping reload entry: " + className);
+                            compile();
+                            continue;
+                        }
+
+                        // Mudança em arquivo .java que deve ser recarregado: COMPILA + RECARREGA
                         System.out.println("[HotReload] Java Change detected: " + changedFile);
+
                         if (compile()) {
                             callReloadEntry();
                         }
@@ -110,6 +121,8 @@ public class HotReload {
                         Path targetCss = classesPath.resolve(changedFile.getFileName());
 
                         try {
+                            // Pausa para estabilidade
+                            Thread.sleep(WATCHER_TIMEOUT_MS);
                             // Força a cópia, sobrescrevendo o arquivo antigo
                             Files.copy(changedFile, targetCss, StandardCopyOption.REPLACE_EXISTING);
                             System.out.println("[HotReload] CSS copied to target/classes.");
@@ -127,6 +140,30 @@ public class HotReload {
         }
     }
 
+    /**
+     * Registra recursivamente todos os diretórios e subdiretórios sob o caminho 'start' no WatchService.
+     */
+    private void registerAll(final WatchService ws, final Path start) throws IOException {
+        Files.walkFileTree(start, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                dir.register(ws, StandardWatchEventKinds.ENTRY_MODIFY, StandardWatchEventKinds.ENTRY_CREATE);
+                System.out.println("[HotReload] Watching directory: " + dir.getFileName());
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    /**
+     * Converte o Path de um arquivo .java para seu nome de classe FQCN (ex: src/main/java/my_app/App.java -> my_app.App).
+     */
+    private String getFullyQualifiedClassName(Path javaFilePath) {
+        String relativePath = this.sourcePath.relativize(javaFilePath).toString();
+        // Remove a extensão .java e substitui barras por pontos
+        String className = relativePath.replace(".java", "").replace(this.sourcePath.getFileSystem().getSeparator(), ".");
+        return className;
+    }
+
     private boolean compile() throws IOException {
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         if (compiler == null) {
@@ -138,9 +175,13 @@ public class HotReload {
         List<String> files = new ArrayList<>();
         Files.walk(sourcePath)
                 .filter(p -> p.toString().endsWith(".java"))
-                .forEach(p -> files.add(p.toString()));
+                .forEach(p -> {
+                    String fqcn = this.getFullyQualifiedClassName(p);
+                    System.out.println("[HotReload] Compiling file: " + fqcn); // NOVO LOG
+                    files.add(p.toString());
+                });
 
-        System.out.println("[HotReload] Compiling...");
+        System.out.println("[HotReload] Compiling " + files.size() + " files...");
 
         // argumentos do javac DEVEM ser separados
         List<String> args = new ArrayList<>();
@@ -159,7 +200,7 @@ public class HotReload {
     private void callReloadEntry() throws Exception {
         URL[] urls = new URL[]{classesPath.toUri().toURL()};
 
-        // Novo: Passa as classes a serem excluídas para o ClassLoader
+        // Passa as classes a serem excluídas para o ClassLoader
         ClassLoader cl = new HotReloadClassLoader(urls, ClassLoader.getSystemClassLoader(), classesToExclude);
 
         // Carrega a classe de recarga NO NOVO ClassLoader, usando o nome da classe injetada
